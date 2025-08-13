@@ -1,0 +1,6 @@
+SubscriptionId,ResourceGroup,Workspace,TablePattern,AnalyticsRetentionDays,DataLakeTotalRetentionInDays,Plan
+54468121-98ba-48ba-ba59-ba10a9711ed3,rg-log-platform-management-security-p,log-platform-management-security-p,SecurityEvent,90,180,Analytics
+54468121-98ba-48ba-ba59-ba10a9711ed3,rg-log-platform-management-security-p,log-platform-management-security-p,Device*Events,90,120,Analytics
+54468121-98ba-48ba-ba59-ba10a9711ed3,rg-log-platform-management-security-p,log-platform-management-security-p,SigninLogs,90,120,Analytics
+54468121-98ba-48ba-ba59-ba10a9711ed3,rg-log-platform-management-security-p,log-platform-management-security-p,*_CL,30,730,Analytics
+54468121-98ba-48ba-ba59-ba10a9711ed3,rg-log-platform-management-security-p,log-platform-management-security-p,TYPE:SENTINEL:ANALYTICS,90,90,Analytics
