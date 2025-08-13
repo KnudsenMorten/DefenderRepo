@@ -1,4 +1,6 @@
 ﻿<# ====================================================================================================
+Developed by Microsoft MVP, Morten Knudsen (aka.ms/morten - mok@mortenknudsen.net)
+
 NAME
     Set-Sentinel-Data-Lake-Retentions.ps1
 
@@ -70,8 +72,8 @@ USAGE
 ==================================================================================================== #>
 
 # ---------- STATIC DEFAULTS ----------
-$DefaultCsvPath  = "C:\TMP\Sentinel-Data-Lake-Retention\Sentinel-Data-Lake-Retentions.csv"
-$DefaultTenantId = "f0fa27a0-8e7c-4f63-9a77-ec94786b7c9e"
+$DefaultCsvPath  = "C:\xxxxxx\Sentinel-Data-Lake-Retention\Sentinel-Data-Lake-Retentions.csv"
+$DefaultTenantId = "<tenant id>"
 $DefaultWhatIf   = $true
 
 # ---------- LOGIN SETTINGS ----------
@@ -93,7 +95,7 @@ $AutoUpgradeSentinelAnalyticsFrom30To90 = $true
 $IncludeNoChangeInSummary = $true
 
 # ---------- READABILITY/OUTPUT TUNING ----------
-$DefaultSummaryCsvPath = "C:\TMP\Sentinel-Data-Lake-Retention\retention-summary_{date}.csv"
+$DefaultSummaryCsvPath = "C:\xxxxxx\Sentinel-Data-Lake-Retention\retention-summary_{date}.csv"
 $EnableOutGridView     = $true
 $ConsoleBufferWidth    = 220
 $MaxRG = 30; $MaxWS = 30; $MaxTable = 42
