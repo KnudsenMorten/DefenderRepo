@@ -1,75 +1,34 @@
-﻿<# ====================================================================================================
-Developed by Microsoft MVP, Morten Knudsen (aka.ms/morten - mok@mortenknudsen.net)
-
-NAME
-    Set-Sentinel-Data-Lake-Retentions.ps1
-
-SYNOPSIS
-    Idempotent per-table retention & plan manager for Microsoft Sentinel / Log Analytics workspaces.
-    Reads desired settings from a CSV and applies them only when different, with a WhatIf-safe dry run.
-
-WHAT COUNTS AS “SENTINEL” HERE?
-    Per your requirement: **if a table exists in the Log Analytics workspace, and the workspace is connected
-    to Sentinel, it is treated as a Sentinel table**—except **Custom** tables, which the UI shows as “Custom”.
-    We therefore classify:
-      • Sentinel  = every Log Analytics table that is NOT Custom
-      • Custom    = schema.tableType = CustomLog  (or name like *_CL)
-      • XDR       = ignored (does not exist in Log Analytics; only in Defender) — TYPE:XDR returns none
-
-DESCRIPTION
-    - Multi-subscription / multi-tenant via per-row SubscriptionId.
-    - Wildcard pattern matching (* and ?) for table names.
-    - Supports special TYPE filters in CSV:
-        TYPE:SENTINEL              → all LA tables that are NOT Custom
-        TYPE:SENTINEL:ANALYTICS    → same, but Plan = Analytics
-        TYPE:CUSTOM                → all CustomLog tables (e.g., *_CL)
-        TYPE:XDR                   → (empty by design; XDR isn’t in LA)
-    - Idempotent: only updates when values differ.
-    - Optional plan changes per table (Analytics/Basic) if provided.
-    - Optional auto-upgrade: Sentinel tables with CSV=30 → 90 days Analytics.
-    - Coverage report (UNMATCHED printed first; full bulleted lists), compact matched summary,
-      and detailed “WhatIf/Changes” section.
-    - Exports a CSV of the full run.
-
-CSV FORMAT
-    Required columns:
-      SubscriptionId,ResourceGroup,Workspace,TablePattern,AnalyticsRetentionDays,DataLakeTotalRetentionInDays
-    Optional:
-      Plan  (Analytics | Basic) — blank to keep current.
-
-    TablePattern can be a wildcard or a TYPE token:
-      Examples:
-        SecurityEvent
-        Device*Events
-        *_CL
-        *
-        TYPE:SENTINEL
-        TYPE:SENTINEL:ANALYTICS
-        TYPE:CUSTOM
-        TYPE:XDR  # returns none (by design)
-
-EXAMPLE CSV
-    SubscriptionId,ResourceGroup,Workspace,TablePattern,AnalyticsRetentionDays,DataLakeTotalRetentionInDays,Plan
-    00000000-0000-0000-0000-000000000000,rg,ws,TYPE:SENTINEL:ANALYTICS,90,365,Analytics
-    00000000-0000-0000-0000-000000000000,rg,ws,SecurityEvent,90,180,Analytics
-    00000000-0000-0000-0000-000000000000,rg,ws,*_CL,30,730,Analytics
-
-AUTO-UPGRADE (OPTIONAL)
-    $AutoUpgradeSentinelAnalyticsFrom30To90 = $true :
-      For **Sentinel** tables (i.e., not Custom), if CSV asks for 30 days, target becomes 90.
-    $AutoUpgradeSentinelAnalyticsFrom30To90 = $false :
-      CSV value is respected.
-
-OUTPUT ORDER
-    1) Out-of-Scope tables (no match) — grouped by workspace header
-    2) Retention Setting after Change (in-scope tables) — grouped by workspace header
-    3) Retention Setting WhatIf Changes (in-scope tables) — grouped by workspace header
-
-USAGE
-    • Run with static defaults (no params):  .\Set-Sentinel-Data-Lake-Retentions.ps1
-    • Actually apply changes:                .\Set-Sentinel-Data-Lake-Retentions.ps1 -WhatIf:$false
-    • Verbose logging:                       .\Set-Sentinel-Data-Lake-Retentions.ps1 -Verbose
-==================================================================================================== #>
+﻿# ====================================================================================================
+# Developed by Microsoft MVP, Morten Knudsen (aka.ms/morten - mok@mortenknudsen.net)
+#
+# NAME
+#     Set-Sentinel-Data-Lake-Retentions.ps1
+#
+# SYNOPSIS
+#     Idempotent per-table retention & plan manager for Microsoft Sentinel / Log Analytics workspaces.
+#     Reads desired settings from a CSV and applies them only when different, with a WhatIf-safe dry run.
+#
+# WHAT COUNTS AS “SENTINEL” HERE?
+#     If a table exists in the Log Analytics workspace and the workspace is connected to Sentinel,
+#     it is treated as a Sentinel table—except Custom tables (schema.tableType = CustomLog or *_CL).
+#
+# DESCRIPTION (abridged)
+#     - Multi-subscription/tenant via per-row SubscriptionId.
+#     - Wildcards (* ?) for table names and TYPE filters: TYPE:SENTINEL, TYPE:SENTINEL:ANALYTICS, TYPE:CUSTOM, TYPE:XDR.
+#     - Auto-upgrade option: Sentinel tables with CSV=30 → 90 days Analytics.
+#     - Coverage report, compact matched summary, and detailed WhatIf/Changes.
+#     - Exports a CSV summary of the full run.
+#     - **Precedence-based application: exact name > wildcard > TYPE:*** (prevents broad rows from overriding specific ones).
+#
+# CSV FORMAT (required)
+#     SubscriptionId,ResourceGroup,Workspace,TablePattern,AnalyticsRetentionDays,DataLakeTotalRetentionInDays
+#     Optional: Plan (Analytics|Basic)
+#
+# USAGE
+#     • Dry run w/ static defaults: .\Set-Sentinel-Data-Lake-Retentions.ps1
+#     • Apply changes:              .\Set-Sentinel-Data-Lake-Retentions.ps1 -WhatIf:$false
+#     • Verbose:                    .\Set-Sentinel-Data-Lake-Retentions.ps1 -Verbose
+# ====================================================================================================
 
 # ---------- STATIC DEFAULTS ----------
 $DefaultCsvPath  = "C:\xxxxxx\Sentinel-Data-Lake-Retention\Sentinel-Data-Lake-Retentions.csv"
@@ -101,6 +60,7 @@ $ConsoleBufferWidth    = 220
 $MaxRG = 30; $MaxWS = 30; $MaxTable = 42
 # ----------------------------------------------
 
+
 # ---------- Output helpers ----------
 function Write-Step([string]$msg) { Write-Host ("[STEP]  {0}" -f $msg) }
 function Write-Info([string]$msg) { Write-Host ("[INFO]  {0}" -f $msg) }
@@ -120,6 +80,42 @@ function Ensure-Module {
   Import-Module $Name -ErrorAction Stop
   Write-Info ("Imported module $($Name).")
 }
+
+function Ensure-SubscriptionContext {
+  param([string]$SubscriptionId)
+
+  $ctx = Get-AzContext
+  if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id -eq $SubscriptionId) {
+    Write-Info ("Already in subscription context $($SubscriptionId).")
+    return $true
+  }
+
+  try {
+    Write-Step ("Setting context to subscription $($SubscriptionId)")
+    Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
+    Write-Done ("Context set to $($SubscriptionId).")
+    return $true
+  } catch {
+    Write-Info ("Set-AzContext failed for $($SubscriptionId): $($_)")
+    try {
+      $subInfo   = Get-AzSubscription -SubscriptionId $SubscriptionId -ErrorAction Stop
+      $subTenant = $subInfo.TenantId
+      if (-not $subTenant) { throw "TenantId not found for subscription $($SubscriptionId)" }
+
+      Write-Step ("Cross-tenant login to Tenant=$($subTenant) for Subscription=$($SubscriptionId)")
+      Invoke-AzLogin -TenantToUse $subTenant
+
+      Write-Step ("Retry Set-AzContext to subscription $($SubscriptionId)")
+      Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
+      Write-Done ("Context set to $($SubscriptionId) after cross-tenant login.")
+      return $true
+    } catch {
+      Write-Err ("Cannot set context to subscription $($SubscriptionId): $($_)")
+      return $false
+    }
+  }
+}
+
 
 function Get-WorkspaceTables {
   param([string]$ResourceGroupName,[string]$WorkspaceName)
@@ -144,7 +140,7 @@ function Get-TableSchemaProp {
   return $null
 }
 
-# CLASSIFICATION (per your rule):
+# CLASSIFICATION:
 # - Custom   = schema.tableType == 'CustomLog' OR name like *_CL (case-insensitive)
 # - Sentinel = NOT Custom  (everything that exists in LA and is not Custom)
 function Test-IsCustomTable {
@@ -157,7 +153,7 @@ function Test-IsCustomTable {
 
 function Test-IsSentinelTable {
   param([object]$Table)
-  return -not (Test-IsCustomTable -Table $Table)  # XDR is not in LA; nothing else to exclude
+  return -not (Test-IsCustomTable -Table $Table)
 }
 
 # --- Login helper (Interactive or Service Principal Secret; no device code) ---
@@ -182,70 +178,52 @@ function Invoke-AzLogin {
   }
 }
 
-# Pattern matching with TYPE: tokens
+# ---------- NEW: Pattern specificity scoring (exact > wildcard > TYPE:*) ----------
+function Get-PatternSpecificity {
+  param([string]$Pattern, [string]$ResolvedPattern)
+
+  if ($ResolvedPattern -match '^(?i)\s*TYPE\s*:\s*') { return 100 }  # lowest class
+
+  $stars = ($ResolvedPattern.ToCharArray() | Where-Object { $_ -eq '*' }).Count
+  $qs    = ($ResolvedPattern.ToCharArray() | Where-Object { $_ -eq '?' }).Count
+  $hasWild = ($stars + $qs) -gt 0
+
+  if (-not $hasWild) { return 1000 } # exact table name
+
+  # wildcards: fewer wildcards is more specific
+  return 600 - ( ($stars * 10) + ($qs * 5) )
+}
+
+# ---------- Updated matcher: returns Matches + Resolved pattern ----------
 function Match-TablesByPattern {
   param([System.Collections.Generic.List[object]]$AllTables,[string]$Pattern)
 
   $norm = Normalize-RequestedName $Pattern
 
-  # Special TYPE tokens
   if ($norm -match '^(?i)\s*TYPE\s*:\s*SENTINEL\s*(?::\s*ANALYTICS\s*)?$') {
     $onlyAnalytics = ($norm -match '(?i):\s*ANALYTICS')
     Write-Info ("Pattern '$($Pattern)' resolved to TYPE:SENTINEL (onlyAnalytics=$($onlyAnalytics))")
     $ts = $AllTables | Where-Object { Test-IsSentinelTable -Table $_ }
     if ($onlyAnalytics) { $ts = $ts | Where-Object { $_.Plan -eq 'Analytics' } }
     Write-Done ("TYPE:SENTINEL matched $(@($ts).Count) tables.")
-    return $ts
+    return [pscustomobject]@{ Matches=$ts; Resolved=$norm }
   }
   if ($norm -match '^(?i)\s*TYPE\s*:\s*CUST(OM)?\s*$') {
     Write-Info ("Pattern '$($Pattern)' resolved to TYPE:CUSTOM")
     $ts = $AllTables | Where-Object { Test-IsCustomTable -Table $_ }
     Write-Done ("TYPE:CUSTOM matched $(@($ts).Count) tables.")
-    return $ts
+    return [pscustomobject]@{ Matches=$ts; Resolved=$norm }
   }
   if ($norm -match '^(?i)\s*TYPE\s*:\s*XDR\s*$') {
     Write-Info ("Pattern '$($Pattern)' resolved to TYPE:XDR (not in LA) → 0 matches by design")
-    return @()
+    return [pscustomobject]@{ Matches=@(); Resolved=$norm }
   }
 
-  # Regular wildcard
   $regex = '^' + (Convert-WildcardToRegex $norm) + '$'
   Write-Info ("Pattern '$($Pattern)' -> regex '$($regex)'")
   $ts = $AllTables | Where-Object { $_.Name -match $regex }
   Write-Done ("Wildcard matched $(@($ts).Count) tables for pattern '$($Pattern)'.")
-  return $ts
-}
-
-# Switch subscription context (with cross-tenant retry)
-function Ensure-SubscriptionContext {
-  param([string]$SubscriptionId)
-  $ctx = Get-AzContext
-  if ($ctx -and $ctx.Subscription -and $ctx.Subscription.Id -eq $SubscriptionId) {
-    Write-Info ("Already in subscription context $($SubscriptionId).")
-    return $true
-  }
-  try {
-    Write-Step ("Setting context to subscription $($SubscriptionId)")
-    Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
-    Write-Done ("Context set to $($SubscriptionId).")
-    return $true
-  } catch {
-    Write-Info ("Set-AzContext failed for $($SubscriptionId): $($_)")
-    try {
-      $subInfo   = Get-AzSubscription -SubscriptionId $SubscriptionId -ErrorAction Stop
-      $subTenant = $subInfo.TenantId
-      if (-not $subTenant) { throw "TenantId not found for subscription $($SubscriptionId)" }
-      Write-Step ("Cross-tenant login to Tenant=$($subTenant) for Subscription=$($SubscriptionId)")
-      Invoke-AzLogin -TenantToUse $subTenant
-      Write-Step ("Retry Set-AzContext to subscription $($SubscriptionId)")
-      Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null
-      Write-Done ("Context set to $($SubscriptionId) after cross-tenant login.")
-      return $true
-    } catch {
-      Write-Err ("Cannot set context to subscription $($SubscriptionId): $($_)")
-      return $false
-    }
-  }
+  return [pscustomobject]@{ Matches=$ts; Resolved=$norm }
 }
 
 # ---- Readability helpers ----
@@ -339,11 +317,13 @@ function Set-SentinelDataLakeRetentions {
     $matchedNames = New-Object System.Collections.Generic.HashSet[string]
     Write-Info ("Scope has $($totalTables) tables in workspace.")
 
+    # ---------- DECISION PASS (build winners per table) ----------
+    $desiredByTable = @{}   # tableName -> @{ TargetPlan=..; TargetHot=..; TargetDL=..; Score=..; FromPattern=.. }
+
     foreach ($row in $g.Group) {
       $pattern   = $row.TablePattern
       $planIn    = $row.Plan
       $retHotCsv = [int]$row.AnalyticsRetentionDays
-      Write-Step ("Row: Pattern='$($pattern)' PlanIn='$($planIn)' AnalyticsRetentionDays='$($retHotCsv)'")
 
       # Data Lake: preferred + fallbacks
       $dlStr = $row.DataLakeTotalRetentionInDays
@@ -355,7 +335,6 @@ function Set-SentinelDataLakeRetentions {
         continue
       }
       $retDataLakeCsv = [int]$dlStr
-      Write-Info ("CSV targets: Analytics_Shortterm=$($retHotCsv)  DataLake_Longterm=$($retDataLakeCsv)")
 
       if ($retHotCsv -lt 4 -or $retHotCsv -gt 730) {
         Write-Skip ("AnalyticsRetentionDays '$($retHotCsv)' out-of-range (4..730) → Skipping row.")
@@ -368,102 +347,131 @@ function Set-SentinelDataLakeRetentions {
         continue
       }
 
-      $matches = Match-TablesByPattern -AllTables ([System.Collections.Generic.List[object]]$tables) -Pattern $pattern
-      if (-not $matches) {
+      $matchObj = Match-TablesByPattern -AllTables ([System.Collections.Generic.List[object]]$tables) -Pattern $pattern
+      $matches  = @($matchObj.Matches)
+      $resolved = $matchObj.Resolved
+
+      if (-not $matches -or $matches.Count -eq 0) {
         Write-Skip ("No tables matched pattern '$($pattern)'.")
         $summary += [pscustomobject]@{ SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$pattern; Plan=$planIn; AnalyticsRetentionInDays=$retHotCsv; DataLakeTotalRetentionInDays=$retDataLakeCsv; Action="NoMatch"; Change=$null }
         continue
       }
 
-      Write-Info ("Pattern '$($pattern)' matched $(@($matches).Count) tables.")
+      $score = Get-PatternSpecificity -Pattern $pattern -ResolvedPattern $resolved
       foreach ($t in $matches) {
         [void]$matchedNames.Add($t.Name)
-
-        $currentPlan     = $t.Plan
-        $currentHot      = [int]$t.RetentionInDays
-        $currentDataLake = [int]$t.TotalRetentionInDays
 
         $isSentinel = Test-IsSentinelTable -Table $t
         $targetHot  = $retHotCsv
         if ($AutoUpgradeSentinelAnalyticsFrom30To90 -and $isSentinel -and $retHotCsv -eq 30) {
-          Write-Info ("Auto-upgrade applies: Table '$($t.Name)' is Sentinel and CSV=30 → target 90.")
           $targetHot = 90
         }
 
-        $targetPlan = if ([string]::IsNullOrWhiteSpace($planIn)) { $currentPlan } else { $planIn }
-
-        $needPlanChange     = ($targetPlan -and $targetPlan -ne $currentPlan)
-        $needHotChange      = ($targetHot -ne $currentHot)
-        $needDataLakeChange = ($retDataLakeCsv -ne $currentDataLake)
-
-        Write-Info ("Table '$($t.Name)' current: Plan=$($currentPlan) Analytics_Shortterm=$($currentHot) DataLake_Longterm=$($currentDataLake); target: Plan=$($targetPlan) Analytics_Shortterm=$($targetHot) DataLake_Longterm=$($retDataLakeCsv)")
-        if (-not ($needPlanChange -or $needHotChange -or $needDataLakeChange)) {
-          Write-Info ("No change required for '$($t.Name)'.")
-          if ($IncludeNoChangeInSummary) {
-            $summary += [pscustomobject]@{
-              SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name; Plan=$currentPlan;
-              AnalyticsRetentionInDays=$currentHot; DataLakeTotalRetentionInDays=$currentDataLake;
-              Action="NoChange"; Change=$null
-            }
-          }
-          continue
+        # record candidate (Plan only if provided; otherwise keep null -> means "keep current plan")
+        $candidate = @{
+          TargetPlan = if ([string]::IsNullOrWhiteSpace($planIn)) { $null } else { $planIn }
+          TargetHot  = $targetHot
+          TargetDL   = $retDataLakeCsv
+          Score      = $score
+          FromPattern= $resolved
         }
 
-        $changeDesc = @()
-        if ($needPlanChange)     { $changeDesc += "Plan: $($currentPlan) -> $($targetPlan)" }
-        if ($needHotChange)      { $changeDesc += "Analytics_Shortterm: $($currentHot) -> $($targetHot)" }
-        if ($needDataLakeChange) { $changeDesc += "DataLake_Longterm: $($currentDataLake) -> $($retDataLakeCsv)" }
-        $changeText = $changeDesc -join '; '
-        $msg = "[$($sub)/$($rg)/$($ws)][$($t.Name)] $($changeText)"
-
-        if ($PSCmdlet.ShouldProcess($t.Name, $msg)) {
-          try {
-            Write-Act ("Updating '$($t.Name)' with: $($changeText)")
-            $args = @{ ResourceGroupName=$rg; WorkspaceName=$ws; TableName=$t.Name }
-            if ($needPlanChange)     { $args['Plan'] = $targetPlan }
-            if ($needHotChange)      { $args['RetentionInDays'] = $targetHot }
-            if ($needDataLakeChange) { $args['TotalRetentionInDays'] = $retDataLakeCsv }
-            Update-AzOperationalInsightsTable @args | Out-Null
-            Write-Done ("Updated '$($t.Name)'.")
-            $summary += [pscustomobject]@{
-              SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name; Plan=$targetPlan;
-              AnalyticsRetentionInDays=$targetHot; DataLakeTotalRetentionInDays=$retDataLakeCsv;
-              Action="Updated"; Change=$changeText
-            }
-          } catch {
-            Write-Info ("Single-call update failed for '$($t.Name)'. Trying two-step. Error: $($_)")
-            $ok = $true
-            if ($needPlanChange) {
-              try {
-                Write-Act ("Updating plan for '$($t.Name)' → $($targetPlan)")
-                Update-AzOperationalInsightsTable -ResourceGroupName $rg -WorkspaceName $ws -TableName $t.Name -Plan $targetPlan | Out-Null
-              } catch { Write-Err ("Plan update failed for '$($t.Name)': $($_)"); $ok = $false }
-            }
-            if ($ok -and ($needHotChange -or $needDataLakeChange)) {
-              try {
-                Write-Act ("Updating retention(s) for '$($t.Name)' (Analytics_Shortterm=$($targetHot) / DataLake_Longterm=$($retDataLakeCsv))")
-                $args2 = @{ ResourceGroupName=$rg; WorkspaceName=$ws; TableName=$t.Name }
-                if ($needHotChange)      { $args2['RetentionInDays'] = $targetHot }
-                if ($needDataLakeChange) { $args2['TotalRetentionInDays'] = $retDataLakeCsv }
-                Update-AzOperationalInsightsTable @args2 | Out-Null
-              } catch { Write-Err ("Retention update failed for '$($t.Name)': $($_)"); $ok = $false }
-            }
-            $summary += [pscustomobject]@{
-              SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name;
-              Plan = if ($needPlanChange) { $targetPlan } else { $currentPlan };
-              AnalyticsRetentionInDays = if ($needHotChange) { $targetHot } else { $currentHot };
-              DataLakeTotalRetentionInDays = if ($needDataLakeChange) { $retDataLakeCsv } else { $currentDataLake };
-              Action = if ($ok) { "Updated" } else { "Error" };
-              Change = $changeText
-            }
-          }
+        if (-not $desiredByTable.ContainsKey($t.Name)) {
+          $desiredByTable[$t.Name] = $candidate
         } else {
-          Write-Sim ("Would update '$($t.Name)' → $($changeText)")
+          # keep the more specific (higher score). On tie, keep existing.
+          if ($candidate.Score -gt $desiredByTable[$t.Name].Score) {
+            $desiredByTable[$t.Name] = $candidate
+          }
+        }
+      }
+    }
+
+    # ---------- APPLY PASS (compare/apply once per table) ----------
+    foreach ($t in ($tables | Sort-Object Name)) {
+      $currentPlan     = $t.Plan
+      $currentHot      = [int]$t.RetentionInDays
+      $currentDataLake = [int]$t.TotalRetentionInDays
+
+      if (-not $desiredByTable.ContainsKey($t.Name)) { continue } # out-of-scope (covered later)
+
+      $desired = $desiredByTable[$t.Name]
+      $targetPlan = if ($null -ne $desired.TargetPlan) { $desired.TargetPlan } else { $currentPlan }
+      $targetHot  = $desired.TargetHot
+      $targetDL   = $desired.TargetDL
+
+      $needPlanChange     = ($targetPlan -ne $currentPlan)
+      $needHotChange      = ($targetHot  -ne $currentHot)
+      $needDataLakeChange = ($targetDL   -ne $currentDataLake)
+
+      Write-Info ("Table '$($t.Name)' current: Plan=$($currentPlan) Analytics_Shortterm=$($currentHot) DataLake_Longterm=$($currentDataLake); target (from '$($desired.FromPattern)'): Plan=$($targetPlan) Analytics_Shortterm=$($targetHot) DataLake_Longterm=$($targetDL)")
+
+      if (-not ($needPlanChange -or $needHotChange -or $needDataLakeChange)) {
+        Write-Info ("No change required for '$($t.Name)'.")
+        if ($IncludeNoChangeInSummary) {
+          $summary += [pscustomobject]@{
+            SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name; Plan=$currentPlan;
+            AnalyticsRetentionInDays=$currentHot; DataLakeTotalRetentionInDays=$currentDataLake;
+            Action="NoChange"; Change=$null
+          }
+        }
+        continue
+      }
+
+      $changeDesc = @()
+      if ($needPlanChange)     { $changeDesc += "Plan: $($currentPlan) -> $($targetPlan)" }
+      if ($needHotChange)      { $changeDesc += "Analytics_Shortterm: $($currentHot) -> $($targetHot)" }
+      if ($needDataLakeChange) { $changeDesc += "DataLake_Longterm: $($currentDataLake) -> $($targetDL)" }
+      $changeText = $changeDesc -join '; '
+      $msg = "[$($sub)/$($rg)/$($ws)][$($t.Name)] $($changeText)"
+
+      if ($PSCmdlet.ShouldProcess($t.Name, $msg)) {
+        try {
+          Write-Act ("Updating '$($t.Name)' with: $($changeText)")
+          $args = @{ ResourceGroupName=$rg; WorkspaceName=$ws; TableName=$t.Name }
+          if ($needPlanChange)     { $args['Plan'] = $targetPlan }
+          if ($needHotChange)      { $args['RetentionInDays'] = $targetHot }
+          if ($needDataLakeChange) { $args['TotalRetentionInDays'] = $targetDL }
+          Update-AzOperationalInsightsTable @args | Out-Null
+          Write-Done ("Updated '$($t.Name)'.")
           $summary += [pscustomobject]@{
             SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name; Plan=$targetPlan;
-            AnalyticsRetentionInDays=$targetHot; DataLakeTotalRetentionInDays=$retDataLakeCsv;
-            Action="WouldUpdate"; Change=$changeText
+            AnalyticsRetentionInDays=$targetHot; DataLakeTotalRetentionInDays=$targetDL;
+            Action="Updated"; Change=$changeText
           }
+        } catch {
+          Write-Info ("Single-call update failed for '$($t.Name)'. Trying two-step. Error: $($_)")
+          $ok = $true
+          if ($needPlanChange) {
+            try {
+              Write-Act ("Updating plan for '$($t.Name)' → $($targetPlan)")
+              Update-AzOperationalInsightsTable -ResourceGroupName $rg -WorkspaceName $ws -TableName $t.Name -Plan $targetPlan | Out-Null
+            } catch { Write-Err ("Plan update failed for '$($t.Name)': $($_)"); $ok = $false }
+          }
+          if ($ok -and ($needHotChange -or $needDataLakeChange)) {
+            try {
+              Write-Act ("Updating retention(s) for '$($t.Name)' (Analytics_Shortterm=$($targetHot) / DataLake_Longterm=$($targetDL))")
+              $args2 = @{ ResourceGroupName=$rg; WorkspaceName=$ws; TableName=$t.Name }
+              if ($needHotChange)      { $args2['RetentionInDays'] = $targetHot }
+              if ($needDataLakeChange) { $args2['TotalRetentionInDays'] = $targetDL }
+              Update-AzOperationalInsightsTable @args2 | Out-Null
+            } catch { Write-Err ("Retention update failed for '$($t.Name)': $($_)"); $ok = $false }
+          }
+          $summary += [pscustomobject]@{
+            SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name;
+            Plan = if ($needPlanChange) { $targetPlan } else { $currentPlan };
+            AnalyticsRetentionInDays = if ($needHotChange) { $targetHot } else { $currentHot };
+            DataLakeTotalRetentionInDays = if ($needDataLakeChange) { $targetDL } else { $currentDataLake };
+            Action = if ($ok) { "Updated" } else { "Error" };
+            Change = $changeText
+          }
+        }
+      } else {
+        Write-Sim ("Would update '$($t.Name)' → $($changeText)")
+        $summary += [pscustomobject]@{
+          SubscriptionId=$sub; ResourceGroup=$rg; Workspace=$ws; Table=$t.Name; Plan=$targetPlan;
+          AnalyticsRetentionInDays=$targetHot; DataLakeTotalRetentionInDays=$targetDL;
+          Action="WouldUpdate"; Change=$changeText
         }
       }
     }
@@ -591,4 +599,6 @@ try {
 } catch {
   Write-Err ("Preloading Az modules failed: $($_)")
 }
+
+# Example invocation (uses defaults/WhatIf unless overridden)
 Set-SentinelDataLakeRetentions -CsvPath $DefaultCsvPath -TenantId $DefaultTenantId -WhatIf:$DefaultWhatIf
