@@ -1,4 +1,17 @@
-﻿# ====================================================================================================
+<#
+.SYNOPSIS
+    Sentinel-Data-Lake-Retentions - engine script in the DefenderRepo solution.
+
+.NOTES
+    Solution       : DefenderRepo
+    File           : Sentinel-Data-Lake-Retentions.ps1
+    Developed by   : Morten Knudsen, Microsoft MVP (Security, Azure, Security Copilot)
+    Blog           : https://mortenknudsen.net  (alias https://aka.ms/morten)
+    GitHub         : https://github.com/KnudsenMorten
+    Support        : For public repos, open a GitHub Issue on that solution's repo.
+
+#>
+# ====================================================================================================
 # Developed by Microsoft MVP, Morten Knudsen (aka.ms/morten - mok@mortenknudsen.net)
 #
 # NAME
